@@ -33,8 +33,8 @@ struct __attribute__((packed)) Config {
   uint32_t magic;
   uint8_t version;
   uint8_t keys[3];             // printable ASCII character for each button
-  uint16_t pollHz;             // 125, 250, 500, 750 or 1000
-  uint8_t debounceMs;          // 0..10; 0 is direct pin reading
+  uint16_t pollHz;             // target GPIO scan rate; USB endpoint is separate
+  uint8_t debounceMs;          // stable-level debounce, 0..10; 0 is direct
   uint8_t red, green, blue;
   uint16_t checksum;
 };
@@ -42,9 +42,10 @@ struct __attribute__((packed)) Config {
 Config config;
 bool physicalPressed[3] = {false, false, false};
 bool debouncedPressed[3] = {false, false, false};
-uint32_t lastAcceptedChangeUs[3] = {0, 0, 0};
+uint32_t rawChangedAtUs[3] = {0, 0, 0};
 bool keyboardDirty = true;
-uint32_t nextReportUs = 0;
+uint32_t nextScanUs = 0;
+bool ledPending = false;
 
 char commandBuffer[160];
 uint8_t commandLength = 0;
@@ -132,20 +133,20 @@ bool asciiToHid(uint8_t ascii, uint8_t &usage, uint8_t &modifier) {
 
 void scanKeys() {
   const uint32_t now = micros();
+  const uint32_t debounceUs = static_cast<uint32_t>(config.debounceMs) * 1000UL;
   for (uint8_t i = 0; i < 3; ++i) {
     const bool rawPressed = digitalRead(KEY_PINS[i]) == LOW;
-    if (rawPressed == physicalPressed[i]) continue;
-    physicalPressed[i] = rawPressed;
+    if (rawPressed != physicalPressed[i]) {
+      physicalPressed[i] = rawPressed;
+      rawChangedAtUs[i] = now;
+    }
 
-    // Eager debounce: accept the first edge immediately, then ignore further
-    // edges for the configured guard time.  At 0 ms every pin edge is direct.
-    if (config.debounceMs == 0 ||
-        static_cast<uint32_t>(now - lastAcceptedChangeUs[i]) >= config.debounceMs * 1000UL) {
-      lastAcceptedChangeUs[i] = now;
-      if (debouncedPressed[i] != rawPressed) {
-        debouncedPressed[i] = rawPressed;
-        keyboardDirty = true;
-      }
+    // Stable-level debounce: every raw edge restarts that key's timer. This
+    // filters bounce symmetrically and cannot lose the final stable level.
+    if (physicalPressed[i] != debouncedPressed[i] &&
+        (debounceUs == 0 || static_cast<uint32_t>(now - rawChangedAtUs[i]) >= debounceUs)) {
+      debouncedPressed[i] = physicalPressed[i];
+      keyboardDirty = true;
     }
   }
 }
@@ -161,21 +162,20 @@ void sendKeyboardReport() {
       report.modifier |= modifier;
     }
   }
-  usb_hid.sendReport(0, &report, sizeof(report));
-  keyboardDirty = false;
+  if (usb_hid.sendReport(0, &report, sizeof(report))) keyboardDirty = false;
 }
 
 void printConfig() {
-  Serial.printf("CFG:K1=%u,K2=%u,K3=%u,HZ=%u,DEB=%u,RGB=%u,%u,%u\\n",
+  Serial.printf("CFG:K1=%u,K2=%u,K3=%u,HZ=%u,DEB=%u,RGB=%u,%u,%u\n",
                 config.keys[0], config.keys[1], config.keys[2], config.pollHz,
                 config.debounceMs, config.red, config.green, config.blue);
 }
 
 bool parseUnsigned(const char *text, unsigned long &result) {
-  if (*text == '\0') return false;
+  if (*text == '\0' || *text == '-') return false;
   char *end;
   result = strtoul(text, &end, 10);
-  return *end == '\0';
+  return end != text && *end == '\0';
 }
 
 void processCommand(char *line) {
@@ -184,30 +184,37 @@ void processCommand(char *line) {
   if (strncmp(line, "SET:", 4) != 0) { Serial.println("ERR:UNKNOWN_COMMAND"); return; }
 
   Config updated = config;
-  bool rgbSet = false;
+  uint8_t seen = 0;
   char *context = nullptr;
   for (char *token = strtok_r(line + 4, ",", &context); token; token = strtok_r(nullptr, ",", &context)) {
     unsigned long value;
-    if (strncmp(token, "K1=", 3) == 0 && parseUnsigned(token + 3, value) && value >= 32 && value <= 126) updated.keys[0] = value;
-    else if (strncmp(token, "K2=", 3) == 0 && parseUnsigned(token + 3, value) && value >= 32 && value <= 126) updated.keys[1] = value;
-    else if (strncmp(token, "K3=", 3) == 0 && parseUnsigned(token + 3, value) && value >= 32 && value <= 126) updated.keys[2] = value;
-    else if (strncmp(token, "HZ=", 3) == 0 && parseUnsigned(token + 3, value) && isAllowedHz(value)) updated.pollHz = value;
-    else if (strncmp(token, "DEB=", 4) == 0 && parseUnsigned(token + 4, value) && value <= 10) updated.debounceMs = value;
+    if (strncmp(token, "K1=", 3) == 0 && !(seen & 1) && parseUnsigned(token + 3, value) && value >= 32 && value <= 126) { updated.keys[0] = value; seen |= 1; }
+    else if (strncmp(token, "K2=", 3) == 0 && !(seen & 2) && parseUnsigned(token + 3, value) && value >= 32 && value <= 126) { updated.keys[1] = value; seen |= 2; }
+    else if (strncmp(token, "K3=", 3) == 0 && !(seen & 4) && parseUnsigned(token + 3, value) && value >= 32 && value <= 126) { updated.keys[2] = value; seen |= 4; }
+    else if (strncmp(token, "HZ=", 3) == 0 && !(seen & 8) && parseUnsigned(token + 3, value) && isAllowedHz(value)) { updated.pollHz = value; seen |= 8; }
+    else if (strncmp(token, "DEB=", 4) == 0 && !(seen & 16) && parseUnsigned(token + 4, value) && value <= 10) { updated.debounceMs = value; seen |= 16; }
     else if (strncmp(token, "RGB=", 4) == 0) {
       unsigned int r, g, b;
       // RGB has commas, so consume its two continuation tokens explicitly.
       char *greenToken = strtok_r(nullptr, ",", &context);
       char *blueToken = strtok_r(nullptr, ",", &context);
-      if (sscanf(token + 4, "%u", &r) != 1 || !greenToken || !blueToken ||
-          sscanf(greenToken, "%u", &g) != 1 || sscanf(blueToken, "%u", &b) != 1 ||
-          r > 255 || g > 255 || b > 255) { Serial.println("ERR:BAD_RGB"); return; }
-      updated.red = r; updated.green = g; updated.blue = b; rgbSet = true;
+      if ((seen & 32) || !parseUnsigned(token + 4, value) || value > 255 || !greenToken || !blueToken) { Serial.println("ERR:BAD_RGB"); return; }
+      r = value;
+      if (!parseUnsigned(greenToken, value) || value > 255) { Serial.println("ERR:BAD_RGB"); return; }
+      g = value;
+      if (!parseUnsigned(blueToken, value) || value > 255) { Serial.println("ERR:BAD_RGB"); return; }
+      b = value;
+      updated.red = r; updated.green = g; updated.blue = b; seen |= 32;
     } else { Serial.println("ERR:BAD_VALUE"); return; }
   }
-  (void)rgbSet;
+  if (seen != 63) { Serial.println("ERR:INCOMPLETE_SET"); return; }
+  const Config previous = config;
   config = updated;
+  nextScanUs = micros();
   saveConfig();
-  applyLed();
+  if (!isValidConfig(config)) { config = previous; Serial.println("ERR:SAVE_FAILED"); return; }
+  // Defer the comparatively slow WS2812 transfer until the next idle service.
+  ledPending = true;
   keyboardDirty = true;
   Serial.println("OK");
   printConfig();
@@ -251,18 +258,24 @@ void setup() {
     // lost merely because the debounce guard interval has not elapsed yet.
     physicalPressed[i] = digitalRead(KEY_PINS[i]) == LOW;
     debouncedPressed[i] = physicalPressed[i];
-    lastAcceptedChangeUs[i] = now - config.debounceMs * 1000UL;
+    rawChangedAtUs[i] = now;
   }
-  nextReportUs = micros();
 }
 
 void loop() {
-  scanKeys();
   readSerialNonBlocking();
   const uint32_t now = micros();
-  const uint32_t interval = 1000000UL / config.pollHz;
-  if (static_cast<int32_t>(now - nextReportUs) >= 0) {
-    nextReportUs = now + interval; // no blocking delay
-    sendKeyboardReport();
+  const uint32_t scanIntervalUs = 1000000UL / config.pollHz;
+  if (static_cast<int32_t>(now - nextScanUs) >= 0) {
+    nextScanUs += scanIntervalUs;
+    if (static_cast<int32_t>(now - nextScanUs) >= 0) nextScanUs = now + scanIntervalUs;
+    scanKeys();
+  }
+  // Send as soon as the debounced state changes. USB endpoint polling is
+  // independently governed by the HID descriptor (1 ms at Full Speed).
+  sendKeyboardReport();
+  if (ledPending && !physicalPressed[0] && !physicalPressed[1] && !physicalPressed[2]) {
+    applyLed();
+    ledPending = false;
   }
 }

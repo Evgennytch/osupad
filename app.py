@@ -9,6 +9,7 @@ Run on Windows:
 import re
 import threading
 import time
+import queue
 import tkinter as tk
 from tkinter import messagebox
 
@@ -33,11 +34,18 @@ class KeypadApplication(ctk.CTk):
         self.minsize(500, 520)
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
-        self.serial_port = None
         self.connected_name = None
         self.last_search = 0.0
         self.tray_icon = None
         self.is_exiting = False
+        self.io_queue = queue.Queue()
+        self.io_thread = threading.Thread(target=self.serial_worker, daemon=True)
+        self.io_thread.start()
+        self.selected_device = None
+        self.tx_queue = queue.Queue()
+        self.rx_queue = queue.Queue()
+        self.connect_request = None
+        self.port_snapshot = []
 
         ctk.set_appearance_mode("system")
         self.key_values = ["z", "x", "c"]
@@ -136,53 +144,36 @@ class KeypadApplication(ctk.CTk):
         return port.vid == 0x2E8A or "rp2040" in text or "tinyusb" in text or "waveshare" in text
 
     def refresh_ports(self):
-        ports = list(list_ports.comports())
-        names = ["Автопоиск"] + [f"{p.device} — {p.description}" for p in ports]
-        self.port_menu.configure(values=names)
-        if self.port_value.get() not in names:
-            self.port_value.set("Автопоиск")
-        self.connect_selected()
+        self.io_queue.put(("list_ports", None))
 
     def desired_device(self):
         selected = self.port_value.get()
         if selected != "Автопоиск":
             return selected.split(" — ", 1)[0]
-        candidates = [p.device for p in list_ports.comports() if self.is_likely_keypad(p)]
+        candidates = [p.device for p in self.port_snapshot if self.is_likely_keypad(p)]
         return candidates[0] if candidates else None
 
     def close_port(self):
-        if self.serial_port:
-            try:
-                self.serial_port.close()
-            except serial.SerialException:
-                pass
-        self.serial_port = None
+        self.io_queue.put(("disconnect", None))
         self.connected_name = None
 
     def connect_selected(self):
         device = self.desired_device()
         if not device:
-            self.close_port()
+            self.connect_request = None
             self.status.set("RP2040-Zero не найден.")
             return
-        if self.serial_port and self.connected_name == device and self.serial_port.is_open:
+        if self.connected_name == device:
             return
-        self.close_port()
-        try:
-            # timeout=0 makes all subsequent reads non-blocking for the GUI.
-            self.serial_port = serial.Serial(device, 115200, timeout=0, write_timeout=0.5)
-            self.connected_name = device
-            time.sleep(0.05)  # brief USB CDC settle, not a UI loop operation
-            self.send_line("GET_CONFIG")
-            self.status.set(f"Подключено: {device}")
-        except (serial.SerialException, OSError) as error:
-            self.close_port()
-            self.status.set(f"Не удалось открыть {device}: {error}")
+        if self.connect_request != device:
+            self.connect_request = device
+            self.io_queue.put(("connect", device))
+            self.status.set(f"Подключение: {device}…")
 
     def send_line(self, line):
-        if not self.serial_port or not self.serial_port.is_open:
+        if not self.connected_name:
             raise serial.SerialException("Устройство не подключено")
-        self.serial_port.write((line + "\n").encode("ascii"))
+        self.io_queue.put(("write", line))
 
     def apply_config(self):
         self.connect_selected()
@@ -192,20 +183,47 @@ class KeypadApplication(ctk.CTk):
             command = (f"SET:K1={values[0]},K2={values[1]},K3={values[2]},HZ={self.poll_rate.get()},"
                        f"DEB={self.debounce.get()},RGB={red},{green},{blue}")
             self.send_line(command)
-            self.status.set("Настройки отправлены и сохранены во Flash.")
+            self.status.set("Команда отправлена; ожидаю подтверждение контроллера…")
         except (serial.SerialException, OSError) as error:
             self.close_port()
             self.status.set(f"Ошибка связи: {error}")
 
     def read_serial(self):
-        if not self.serial_port or not self.serial_port.is_open:
-            return
-        try:
-            while self.serial_port.in_waiting:
-                line = self.serial_port.readline().decode("ascii", errors="replace").strip()
+        while True:
+            try:
+                kind, payload = self.rx_queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "connected":
+                self.status.set(f"Проверка устройства: {payload}…")
+            elif kind == "ports":
+                self.port_snapshot = payload
+                names = ["Автопоиск"] + [f"{p.device} — {p.description}" for p in payload]
+                self.port_menu.configure(values=names)
+                if self.port_value.get() not in names:
+                    self.port_value.set("Автопоиск")
+                self.connect_selected()
+            elif kind == "identified":
+                self.connected_name = payload
+                self.connect_request = payload
+                self.status.set(f"Подключено: {payload}")
+                self.io_queue.put(("write", "GET_CONFIG"))
+            elif kind == "disconnected":
+                self.connected_name = None
+                self.connect_request = None
+                self.status.set(f"Соединение потеряно: {payload}")
+            elif kind == "error":
+                self.connected_name = None
+                self.connect_request = None
+                self.status.set(f"Ошибка Serial: {payload}")
+            elif kind == "line":
+                line = payload
                 match = CONFIG_PATTERN.match(line)
                 if match:
                     data = [int(value) for value in match.groups()]
+                    if data[0] not in range(32, 127) or data[1] not in range(32, 127) or data[2] not in range(32, 127) or data[3] not in map(int, POLL_RATES) or data[4] > 10 or any(v > 255 for v in data[5:]):
+                        self.status.set("Контроллер прислал настройки вне допустимого диапазона.")
+                        continue
                     self.key_values = [chr(value) for value in data[:3]]
                     for index, key in enumerate(self.key_values):
                         self.key_labels[index].configure(text=f"K{index + 1}: {key}")
@@ -213,18 +231,79 @@ class KeypadApplication(ctk.CTk):
                     self.debounce.set(data[4])
                     for index in range(3): self.rgb[index].set(data[5 + index])
                     self.update_labels()
-                    self.status.set(f"Конфигурация прочитана: {self.connected_name}")
+                    self.status.set(f"Настройки контроллера прочитаны: {self.connected_name}")
+                elif line == "OK":
+                    self.status.set("Настройки сохранены во Flash.")
                 elif line.startswith("ERR:"):
                     self.status.set("Контроллер: " + line)
-        except (serial.SerialException, OSError) as error:
-            self.close_port()
-            self.status.set(f"Соединение потеряно: {error}")
+
+    def serial_worker(self):
+        port = None
+        active_device = None
+        awaiting_identity = False
+        pending = bytearray()
+        while not self.is_exiting:
+            try:
+                try:
+                    action, payload = self.io_queue.get(timeout=0.02)
+                    if action == "connect":
+                        if port:
+                            port.close()
+                            port = None
+                        active_device = payload
+                        awaiting_identity = True
+                        pending.clear()
+                        port = serial.Serial(payload, 115200, timeout=0.02, write_timeout=0.2)
+                        self.rx_queue.put(("connected", payload))
+                        port.write(b"PING\n")
+                    elif action == "list_ports":
+                        self.rx_queue.put(("ports", list(list_ports.comports())))
+                    elif action == "disconnect":
+                        if port:
+                            port.close()
+                            port = None
+                        active_device = None
+                    elif action == "stop":
+                        if port:
+                            port.close()
+                        return
+                    elif action == "write" and port and port.is_open:
+                        port.write((payload + "\n").encode("ascii"))
+                except queue.Empty:
+                    pass
+                if port and port.is_open:
+                    data = port.read(port.in_waiting or 1)
+                    if data:
+                        pending.extend(data)
+                        while b"\n" in pending:
+                            raw, _, rest = pending.partition(b"\n")
+                            pending = bytearray(rest)
+                            line = raw.decode("ascii", errors="replace").strip()
+                            if awaiting_identity:
+                                if line == "PONG":
+                                    awaiting_identity = False
+                                    self.rx_queue.put(("identified", active_device))
+                                elif line.startswith("ERR:"):
+                                    port.close()
+                                    port = None
+                                    self.rx_queue.put(("error", "порт не подтвердил протокол keypad"))
+                                continue
+                            self.rx_queue.put(("line", line))
+            except (serial.SerialException, OSError) as error:
+                if port:
+                    try: port.close()
+                    except (serial.SerialException, OSError): pass
+                port = None
+                awaiting_identity = False
+                self.rx_queue.put(("disconnected", str(error)))
+                active_device = None
+                awaiting_identity = False
 
     def connection_tick(self):
         self.read_serial()
         if time.monotonic() - self.last_search > 2:
             self.last_search = time.monotonic()
-            if not self.serial_port or not self.serial_port.is_open:
+            if not self.connected_name and not self.connect_request:
                 self.refresh_ports()
         if not self.is_exiting:
             self.after(50, self.connection_tick)
@@ -256,9 +335,10 @@ class KeypadApplication(ctk.CTk):
 
     def exit_application(self):
         self.is_exiting = True
-        self.close_port()
+        self.io_queue.put(("stop", None))
         if self.tray_icon:
             self.tray_icon.stop()
+        self.io_thread.join(timeout=0.5)
         self.destroy()
 
 

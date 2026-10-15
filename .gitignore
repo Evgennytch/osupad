@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+
+# PyInstaller and local builds
+build/
+dist/
+*.spec
+
+# Arduino IDE output
+.arduinoIDE/
+*.elf
+*.hex
+*.uf2
+*.map
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
